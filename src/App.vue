@@ -3,8 +3,11 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { geoInterpolate } from 'd3-geo';
 import { Group } from 'three';
 import * as THREE from 'three';
+import globeVertexShader from './shaders/globe/globeVertex.glsl';
+import globeFragmentShader from './shaders/globe/globeFragment.glsl';
 
 let container: HTMLElement | null = document.querySelector('#app');
 let scene: THREE.Object3D<THREE.Event> | THREE.Scene;
@@ -16,6 +19,11 @@ let globMap: any;
 const GLOBE_RADIUS = 25;
 const WORLD_DOT_ROWS = 200;
 const WORLD_DOT_SIZE = 0.095;
+const CURVE_MIN_ALTITUDE = 12;
+const CURVE_MAX_ALTITUDE = 12;
+const CURVE_SEGMENTS = 64;
+const CURVE_RADIUS_SEGMENTS = 8;
+const CURVE_RADIUS = 0.1;
 
 onMounted(() => {
   // Création de la scène
@@ -42,28 +50,54 @@ onMounted(() => {
 
   // On récupère la position de départ en fonction de celle de l'utilisateur
   const euler = new THREE.Euler(0.3, 4.6, 0.05);
-  let rotation = euler;
   const offset = new Date().getTimezoneOffset() || 0;
-  rotation.y = euler.y + Math.PI * (offset / 720);
-  objectsGroup.rotation.copy(rotation);
+  euler.y = euler.y + Math.PI * (offset / 720);
+  // objectsGroup.rotation.copy(euler);
 
   scene.add(objectsGroup);
 
   // Mise en place d'orbite control
   const controls: OrbitControls = new OrbitControls(camera, renderer.domElement);
-  controls.maxDistance = 100;
-  controls.minDistance = 30;
+  controls.maxDistance = 120;
+  controls.minDistance = 10;
 
-  // Création de la sphère représentant le glob
-  const geometry = new THREE.SphereGeometry(GLOBE_RADIUS, 64, 32);
-  const material = new THREE.MeshBasicMaterial({ color: 0xf5f6fa, transparent: true });
-  const sphere = new THREE.Mesh(geometry, material);
-  scene.add(sphere);
+  // Création de la sphère représentant le globe
+  const globeGeometry = new THREE.SphereGeometry(GLOBE_RADIUS, 64, 32);
+  const globeMaterial = new THREE.MeshBasicMaterial({ color: 0x98b8f3, transparent: true });
+  const globeSphere = new THREE.Mesh(globeGeometry, globeMaterial);
+  scene.add(globeSphere);
 
+  // Création de la sphère représentant l'ombrage du globe
+  const atmosphereGeometry = new THREE.SphereGeometry(GLOBE_RADIUS, 64, 32);
+  const atmosphereMaterial = new THREE.ShaderMaterial({
+    vertexShader: globeVertexShader,
+    fragmentShader: globeFragmentShader,
+    side: THREE.BackSide,
+    blending: THREE.AdditiveBlending,
+    transparent: true,
+  });
+  const atmosphereSphere = new THREE.Mesh(atmosphereGeometry, atmosphereMaterial);
+  atmosphereSphere.scale.set(1.25, 1.25, 1.25);
+  scene.add(atmosphereSphere);
+
+  // Création de l'image pour récupérer la position des points
   globMap = new Image();
   globMap.src = './assets/glob-map.png';
-  globMap.crossOrigin = 'Anonymous';
   globMap.onload = () => initDots();
+
+  // Création de la courbe représentant un vol
+  const coords = [-33.865143, 151.2099, 34.052235, -118.243683];
+
+  const pathMaterial = new THREE.MeshBasicMaterial({
+    blending: THREE.AdditiveBlending,
+    transparent: false,
+    color: 0xe43c59,
+    opacity: 1,
+  });
+  const curve = drawLine(coords, pathMaterial);
+  const pathMesh = new THREE.Mesh();
+  pathMesh.add(curve);
+  scene.add(pathMesh);
 
   // Lumières
   const directionLight: THREE.DirectionalLight = new THREE.DirectionalLight(0xffffff, 2);
@@ -87,41 +121,101 @@ onMounted(() => {
 const initDots = () => {
   const object = new THREE.Object3D();
   const imageData = getImageData(globMap);
-  const i = [];
+  const points = [];
 
   for (let lat = -90; lat <= 90; lat += 180 / WORLD_DOT_ROWS) {
     const radius = Math.cos(Math.abs(lat) * THREE.MathUtils.DEG2RAD) * GLOBE_RADIUS;
     const circum = radius * Math.PI * 2 * 2;
 
-    for (let r = 0; r < circum; r++) {
-      const lng = (360 * r) / circum - 180;
+    for (let i = 0; i < circum; i++) {
+      const lng = (360 * i) / circum - 180;
 
-      if (!visibilityForCoordinates(lat, lng, imageData)) continue;
+      if (visibilityForCoordinates(lat, lng, imageData)) {
+        const dotPosition = computeDotPosition(lat, lng, GLOBE_RADIUS);
+        object.position.set(dotPosition.x, dotPosition.y, dotPosition.z);
 
-      const s = computeDotPosition(lat, lng, GLOBE_RADIUS);
-      object.position.set(s.x, s.y, s.z);
-
-      const o = computeDotPosition(lat, lng, GLOBE_RADIUS + 5);
-      object.lookAt(o.x, o.y, o.z);
-      object.updateMatrix();
-      i.push(object.matrix.clone());
+        const o = computeDotPosition(lat, lng, GLOBE_RADIUS + 5);
+        object.lookAt(o.x, o.y, o.z);
+        object.updateMatrix();
+        points.push(object.matrix.clone());
+      }
     }
   }
 
   const dotGeometry = new THREE.CircleGeometry(WORLD_DOT_SIZE, 8);
-  const dotMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2c3e50,
+  const dotMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
     transparent: true,
   });
 
-  const dotMesh = new THREE.InstancedMesh(dotGeometry, dotMaterial, i.length);
+  const dotMesh = new THREE.InstancedMesh(dotGeometry, dotMaterial, points.length);
 
-  for (let l = 0; l < i.length; l++) {
-    dotMesh.setMatrixAt(l, i[l]);
+  for (let l = 0; l < points.length; l++) {
+    dotMesh.setMatrixAt(l, points[l]);
   }
 
   dotMesh.renderOrder = 3;
   objectsGroup.add(dotMesh);
+};
+
+// Converti une coordonnée en position sur le globe
+const coordinateToPosition = (lat, lng, radius) => {
+  const phi = (90 - lat) * THREE.MathUtils.DEG2RAD;
+  const theta = (lng + 180) * THREE.MathUtils.DEG2RAD;
+
+  return new THREE.Vector3(
+    -radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta)
+  );
+};
+
+const drawLine = (coords, material) => {
+  const { spline } = getSplineFromCoordinates(coords);
+  const geometry = new THREE.TubeGeometry(
+    spline,
+    CURVE_SEGMENTS,
+    CURVE_RADIUS,
+    CURVE_RADIUS_SEGMENTS,
+    false
+  );
+
+  // 6 sommets par face, fois 8 faces, fois le nombre de lignes, ici 64
+  geometry.setDrawRange(0, 6 * CURVE_RADIUS_SEGMENTS * CURVE_SEGMENTS);
+
+  return new THREE.Mesh(geometry, material);
+};
+
+const getSplineFromCoordinates = (coords) => {
+  const startLat = coords[0];
+  const startLng = coords[1];
+  const endLat = coords[2];
+  const endLng = coords[3];
+
+  // Start and end points
+  const start = coordinateToPosition(startLat, startLng, GLOBE_RADIUS);
+  const end = coordinateToPosition(endLat, endLng, GLOBE_RADIUS);
+
+  // Altitude
+  const altitude = clamp(start.distanceTo(end) * 0.75, CURVE_MIN_ALTITUDE, CURVE_MAX_ALTITUDE);
+
+  // 2 control points
+  const interpolate = geoInterpolate([startLng, startLat], [endLng, endLat]);
+  const midCoord1 = interpolate(0.3);
+  const midCoord2 = interpolate(0.7);
+  const mid1 = coordinateToPosition(midCoord1[1], midCoord1[0], GLOBE_RADIUS + altitude);
+  const mid2 = coordinateToPosition(midCoord2[1], midCoord2[0], GLOBE_RADIUS + altitude);
+
+  return {
+    start,
+    end,
+    spline: new THREE.CubicBezierCurve3(start, mid1, mid2, end),
+  };
+};
+
+// Clamp
+const clamp = (num, min, max) => {
+  return num <= min ? min : num >= max ? max : num;
 };
 
 // Calcule si pour une coordonnée, le point doit-être affiché sur le globe ou non
@@ -175,10 +269,4 @@ const render = (): void => {
 };
 </script>
 
-<style scoped lang="postcss">
-canvas {
-  border: 2px solid red;
-  width: 100%;
-  height: 100%;
-}
-</style>
+<style scoped lang="postcss"></style>
